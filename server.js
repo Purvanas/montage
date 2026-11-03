@@ -467,8 +467,13 @@ function stampAssets(html) {
 }
 
 function serveStatic(req, res) {
-  const url = new URL(req.url, "http://localhost");
-  let pathname = decodeURIComponent(url.pathname);
+  let pathname;
+  try {
+    pathname = decodeURIComponent(new URL(req.url, "http://localhost").pathname);
+  } catch {
+    sendJson(res, 400, { error: "Adresse invalide." });
+    return;
+  }
   if (pathname === "/") pathname = "/index.html";
   const file = path.normalize(path.join(PUBLIC, pathname));
   if (file !== PUBLIC && !file.startsWith(PUBLIC + path.sep)) {
@@ -687,8 +692,13 @@ async function handleCut(req, res) {
 }
 
 function handle(req, res) {
-  const url = new URL(req.url, "http://localhost");
-  const pathname = url.pathname;
+  let pathname;
+  try {
+    pathname = new URL(req.url, "http://localhost").pathname;
+  } catch {
+    sendJson(res, 400, { error: "Adresse invalide." });
+    return;
+  }
   if (req.method === "GET" && pathname === "/api/health") {
     sendJson(res, 200, { ok: true });
     return;
