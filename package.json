@@ -1,0 +1,14 @@
+{
+  "name": "montage",
+  "version": "1.0.0",
+  "license": "MIT",
+  "description": "Réunit jusqu’à cinq vidéos, ou coupe une vidéo et son son.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test --test-concurrency=1"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

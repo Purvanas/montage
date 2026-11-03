@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#141210">
+  <meta name="description" content="Réunis jusqu’à cinq vidéos dans un seul film, ou coupe une vidéo et son son.">
+  <title>Montage — vidéos ensemble</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="preload" href="/fonts/fraunces-italic-latin.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="/fonts/outfit-latin.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <p class="eyebrow"><span class="mark" aria-hidden="true"></span> Montage</p>
+      <nav class="tabs" role="tablist" aria-label="Outils">
+        <button type="button" class="tab is-on" id="tab-ensemble" role="tab" aria-selected="true" aria-controls="view-ensemble">Ensemble</button>
+        <button type="button" class="tab" id="tab-couper" role="tab" aria-selected="false" aria-controls="view-cut">Couper</button>
+      </nav>
+      <h1 id="page-title">Jusqu’à cinq vidéos,<br>en même temps.</h1>
+      <p class="lede" id="page-lede">Tu les déposes. Elles jouent ensemble, dans un seul film. À cinq, la dernière se pose au centre.</p>
+    </header>
+
+    <main id="view-ensemble" role="tabpanel" aria-labelledby="tab-ensemble">
+      <section class="viewer" aria-label="Aperçu">
+        <div class="stage" id="stage"></div>
+        <div class="tools">
+          <button type="button" id="play" class="ghost" disabled>Lecture</button>
+          <button type="button" id="sound" class="ghost" disabled aria-pressed="false">Écouter</button>
+          <button type="button" id="all-audio" class="ghost" disabled aria-pressed="false">Toutes</button>
+          <p class="caption" id="caption"></p>
+        </div>
+        <p class="hint" id="crop-note">Chaque case est remplie en rognant les bords. L’aperçu est muet tant que tu n’actives pas le son. Le haut-parleur de chaque vidéo choisit sa piste : une, plusieurs, ou toutes.</p>
+      </section>
+
+      <section class="panel" aria-label="Vidéos">
+        <label class="drop" id="drop">
+          <input id="file" type="file" accept="video/mp4,video/webm,video/quicktime,video/x-matroska,.mp4,.mov,.webm,.mkv,.m4v" multiple>
+          <strong id="drop-title">Dépose les vidéos ici</strong>
+          <span id="drop-sub">ou clique pour les choisir</span>
+          <span class="fine">MP4, MOV, WEBM, MKV · 5 maximum · 500&nbsp;Mo chacune</span>
+        </label>
+        <p class="warn" id="warn" hidden></p>
+        <ol class="clips" id="clips"></ol>
+        <div class="timing">
+          <div class="choice" id="span-choice" role="radiogroup" aria-label="Durée du film">
+            <span>Durée</span>
+            <button type="button" class="ghost is-on" data-span="short" aria-pressed="true">La plus courte</button>
+            <button type="button" class="ghost" data-span="long" aria-pressed="false">La plus longue</button>
+          </div>
+          <div class="choice is-locked" id="end-choice" role="radiogroup" aria-label="Quand une vidéo finit avant les autres">
+            <span>Finit avant</span>
+            <button type="button" class="ghost" data-finish="loop" aria-pressed="false" disabled>Boucle</button>
+            <button type="button" class="ghost is-on" data-finish="black" aria-pressed="true" disabled>Écran noir</button>
+          </div>
+        </div>
+        <p class="duration" id="duration"></p>
+        <fieldset class="titlebox">
+          <legend>Titre</legend>
+          <input id="title" type="text" maxlength="80" placeholder="Une ligne, ou rien" autocomplete="off">
+          <div class="title-row">
+            <div class="sizes" id="title-sizes" role="radiogroup" aria-label="Taille du titre">
+              <button type="button" class="ghost" data-size="s" aria-pressed="false">Petit</button>
+              <button type="button" class="ghost is-on" data-size="m" aria-pressed="true">Moyen</button>
+              <button type="button" class="ghost" data-size="l" aria-pressed="false">Grand</button>
+            </div>
+            <div class="places" id="title-places" role="group" aria-label="Position du titre">
+              <button type="button" data-place="tl" aria-label="En haut à gauche" aria-pressed="false"></button>
+              <button type="button" data-place="tc" aria-label="En haut" aria-pressed="false"></button>
+              <button type="button" data-place="tr" aria-label="En haut à droite" aria-pressed="false"></button>
+              <button type="button" data-place="ml" aria-label="À gauche" aria-pressed="false"></button>
+              <button type="button" data-place="mc" aria-label="Au centre" aria-pressed="false"></button>
+              <button type="button" data-place="mr" aria-label="À droite" aria-pressed="false"></button>
+              <button type="button" data-place="bl" aria-label="En bas à gauche" aria-pressed="false"></button>
+              <button type="button" data-place="bc" aria-label="En bas" aria-pressed="true" class="is-on"></button>
+              <button type="button" data-place="br" aria-label="En bas à droite" aria-pressed="false"></button>
+            </div>
+          </div>
+        </fieldset>
+        <button type="button" id="render" class="primary" disabled>Rendre la vidéo</button>
+        <div class="status" id="status" hidden>
+          <div class="bar" aria-hidden="true"><div id="bar"></div></div>
+          <p id="status-text" role="status"></p>
+        </div>
+        <p class="error" id="error" hidden></p>
+        <a class="primary download" id="download" hidden>Télécharger le MP4</a>
+      </section>
+    </main>
+
+    <main id="view-cut" role="tabpanel" aria-labelledby="tab-couper" hidden>
+      <section class="viewer" aria-label="Aperçu de la coupe">
+        <div class="stage stage-cut" id="cut-stage">
+          <video id="cut-video" hidden playsinline preload="metadata"></video>
+          <p class="stage-empty" id="cut-empty">Dépose une vidéo pour la couper.</p>
+        </div>
+        <div class="tools">
+          <button type="button" id="cut-play" class="ghost" disabled>Lecture</button>
+          <button type="button" id="cut-split" class="ghost" disabled>Couper ici</button>
+          <p class="caption" id="cut-caption"></p>
+        </div>
+        <div class="timeline" id="cut-timeline" hidden></div>
+        <p class="hint">Glisse sur la barre pour te placer. Coupe au curseur, puis clique un morceau pour le retirer ou le remettre. L’aperçu joue le son tel qu’il sortira.</p>
+      </section>
+
+      <section class="panel" aria-label="Coupe">
+        <label class="drop" id="cut-drop">
+          <input id="cut-file" type="file" accept="video/mp4,video/webm,video/quicktime,video/x-matroska,.mp4,.mov,.webm,.mkv,.m4v">
+          <strong id="cut-drop-title">Dépose une vidéo ici</strong>
+          <span id="cut-drop-sub">ou clique pour la choisir</span>
+          <span class="fine">MP4, MOV, WEBM, MKV · une seule · 500&nbsp;Mo</span>
+        </label>
+        <p class="warn" id="cut-warn" hidden></p>
+        <div class="soundline">
+          <label for="cut-volume">Son <span id="cut-volume-value">100&nbsp;%</span></label>
+          <input id="cut-volume" type="range" min="0" max="100" step="1" value="100" disabled>
+          <button type="button" id="cut-mute" class="ghost" disabled>Couper le son</button>
+        </div>
+        <p class="duration" id="cut-summary"></p>
+        <fieldset class="titlebox">
+          <legend>Titre</legend>
+          <input id="cut-title" type="text" maxlength="80" placeholder="Une ligne, ou rien" autocomplete="off">
+          <div class="title-row">
+            <div class="sizes" id="cut-title-sizes" role="radiogroup" aria-label="Taille du titre">
+              <button type="button" class="ghost" data-size="s" aria-pressed="false">Petit</button>
+              <button type="button" class="ghost is-on" data-size="m" aria-pressed="true">Moyen</button>
+              <button type="button" class="ghost" data-size="l" aria-pressed="false">Grand</button>
+            </div>
+            <div class="places" id="cut-title-places" role="group" aria-label="Position du titre">
+              <button type="button" data-place="tl" aria-label="En haut à gauche" aria-pressed="false"></button>
+              <button type="button" data-place="tc" aria-label="En haut" aria-pressed="false"></button>
+              <button type="button" data-place="tr" aria-label="En haut à droite" aria-pressed="false"></button>
+              <button type="button" data-place="ml" aria-label="À gauche" aria-pressed="false"></button>
+              <button type="button" data-place="mc" aria-label="Au centre" aria-pressed="false"></button>
+              <button type="button" data-place="mr" aria-label="À droite" aria-pressed="false"></button>
+              <button type="button" data-place="bl" aria-label="En bas à gauche" aria-pressed="false"></button>
+              <button type="button" data-place="bc" aria-label="En bas" aria-pressed="true" class="is-on"></button>
+              <button type="button" data-place="br" aria-label="En bas à droite" aria-pressed="false"></button>
+            </div>
+          </div>
+        </fieldset>
+        <button type="button" id="cut-render" class="primary" disabled>Rendre la coupe</button>
+        <div class="status" id="cut-status" hidden>
+          <div class="bar" aria-hidden="true"><div id="cut-bar"></div></div>
+          <p id="cut-status-text" role="status"></p>
+        </div>
+        <p class="error" id="cut-error" hidden></p>
+        <a class="primary download" id="cut-download" hidden>Télécharger le MP4</a>
+      </section>
+    </main>
+
+    <footer>
+      <p>Ensemble sort en 1920×1080. Couper garde la taille d’origine. Les fichiers sont effacés au bout de deux heures.</p>
+    </footer>
+  </div>
+  <noscript><p class="noscript">Le montage a besoin de JavaScript.</p></noscript>
+  <script src="/app.js"></script>
+  <script src="/cut.js"></script>
+</body>
+</html>
