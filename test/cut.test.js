@@ -213,6 +213,11 @@ test("l’API coupe une vidéo et refuse des coupes illisibles", { timeout: 1200
     const tooMany = await fetch(`${base}/api/cuts`, { method: "POST", body: extra });
     assert.equal(tooMany.status, 400);
     assert.match((await tooMany.json()).error, /Une seule vidéo/);
+    assert.deepEqual(
+      fs.readdirSync(dir).filter((name) => /^[0-9a-f-]{36}$/i.test(name)),
+      [],
+      "les uploads refusés ne doivent laisser aucun dossier temporaire"
+    );
 
     const source = await makeClip(dir, "source.mp4", { seconds: 1.2 });
     const body = new FormData();

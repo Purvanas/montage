@@ -24,7 +24,9 @@ public/            interface responsive et aperçu local
 test/              tests unitaires, HTTP et rendus vidéo
 ```
 
-Le serveur n’a aucune dépendance npm. Le parseur multipart écrit les uploads en flux avec backpressure, limite chaque fichier à 500 Mo et n’accepte que cinq vidéos. Une seule tâche est encodée à la fois ; trois autres peuvent attendre. Les données d’un job expirent après deux heures et les dossiers abandonnés sont nettoyés plus tôt.
+Le serveur n’a aucune dépendance npm. Le parseur multipart écrit les uploads en flux avec backpressure, limite chaque fichier à 500 Mo et n’accepte que cinq vidéos. Une limite globale — somme des tailles de fichiers plus une marge multipart configurable — couvre aussi les champs inconnus, les envois HTTP chunked et les octets placés après la boundary finale. Si un téléphone interrompt l’upload, les flux sont fermés avant la suppression du dossier temporaire.
+
+Une seule tâche est encodée à la fois ; trois autres peuvent attendre. Les données d’un job expirent après deux heures et les dossiers abandonnés sont nettoyés plus tôt. Le limiteur par adresse expire ses entrées après une heure et borne également leur nombre en mémoire.
 
 ## Installation
 
@@ -35,7 +37,7 @@ cp .env.example .env
 npm start
 ```
 
-Les variables ne sont pas chargées automatiquement depuis `.env`. Par défaut, le serveur écoute sur `127.0.0.1:4710`. Le dossier de travail peut être placé sur un volume dédié avec `MONTAGE_DATA`.
+Les variables ne sont pas chargées automatiquement depuis `.env`. Par défaut, le serveur écoute sur `127.0.0.1:4710`. Le dossier de travail peut être placé sur un volume dédié avec `MONTAGE_DATA`. `MONTAGE_UPLOAD_OVERHEAD_BYTES` règle la marge multipart globale (1 Mio par défaut) et `MONTAGE_MAX_HIT_CLIENTS` borne la table du limiteur (5 000 entrées par défaut).
 
 ## Limites
 

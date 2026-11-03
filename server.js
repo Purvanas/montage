@@ -15,6 +15,7 @@ const {
 const { RenderError, probeVideo, renderToFile, parseAudioSelection, parseTiming } = require("./lib/render");
 const { parseRangesField, parseVolume, normalizeRanges, renderCut } = require("./lib/cut");
 const { parseTitle } = require("./lib/title");
+const { expireFinishedJobs } = require("./lib/retention");
 
 const PORT = Number(process.env.PORT || 4710);
 const HOST = process.env.HOST || "127.0.0.1";
@@ -22,6 +23,9 @@ const DATA = process.env.MONTAGE_DATA || path.join(__dirname, "data");
 const PUBLIC = path.join(__dirname, "public");
 const TTL_MS = 2 * 60 * 60 * 1000;
 const ORPHAN_MS = 30 * 60 * 1000;
+const HIT_WINDOW_MS = 60 * 60 * 1000;
+const DEFAULT_UPLOAD_OVERHEAD_BYTES = 1024 * 1024;
+const DEFAULT_MAX_HIT_CLIENTS = 5000;
 const ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const EXT_OK = new Set([".mp4", ".m4v", ".mov", ".webm", ".mkv", ".ogv", ".ogg", ".mpg", ".mpeg"]);
@@ -57,15 +61,52 @@ function clientIp(req) {
 
 function tooMany(ip) {
   const now = Date.now();
-  const recent = (hits.get(ip) || []).filter((time) => now - time < 3600_000);
-  hits.set(ip, recent);
+  const recent = (hits.get(ip) || []).filter((time) => now - time < HIT_WINDOW_MS);
+  if (recent.length) hits.set(ip, recent);
+  else hits.delete(ip);
   return recent.length >= 30;
 }
 
-function noteIp(ip) {
+function pruneHits(maxHitClients = DEFAULT_MAX_HIT_CLIENTS, now = Date.now()) {
+  for (const [ip, timestamps] of hits) {
+    const recent = timestamps.filter((time) => now - time < HIT_WINDOW_MS);
+    if (recent.length) hits.set(ip, recent);
+    else hits.delete(ip);
+  }
+  if (hits.size <= maxHitClients) return;
+  const oldestFirst = [...hits.entries()]
+    .map(([ip, timestamps]) => [ip, timestamps[timestamps.length - 1] || 0])
+    .sort((a, b) => a[1] - b[1]);
+  for (let index = 0; hits.size > maxHitClients && index < oldestFirst.length; index += 1) {
+    hits.delete(oldestFirst[index][0]);
+  }
+}
+
+function noteIp(ip, maxHitClients) {
   const recent = hits.get(ip) || [];
   recent.push(Date.now());
   hits.set(ip, recent);
+  if (hits.size > maxHitClients) pruneHits(maxHitClients);
+}
+
+function positiveInteger(value, fallback) {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function requestLimits(options = {}) {
+  return {
+    maxClips: positiveInteger(options.maxClips, MAX_CLIPS),
+    maxFileBytes: positiveInteger(options.maxFileBytes, MAX_FILE_BYTES),
+    uploadOverheadBytes: positiveInteger(
+      options.uploadOverheadBytes,
+      positiveInteger(process.env.MONTAGE_UPLOAD_OVERHEAD_BYTES, DEFAULT_UPLOAD_OVERHEAD_BYTES)
+    ),
+    maxHitClients: positiveInteger(
+      options.maxHitClients,
+      positiveInteger(process.env.MONTAGE_MAX_HIT_CLIENTS, DEFAULT_MAX_HIT_CLIENTS)
+    ),
+  };
 }
 
 function extFor(file) {
@@ -89,6 +130,7 @@ function safeName(name) {
 
 function uploadMessage(err, single) {
   if (err?.code === "LIMIT_FILE_SIZE") return "Chaque vidéo doit faire moins de 500 Mo.";
+  if (err?.code === "LIMIT_TOTAL_SIZE") return "Envoi trop lourd.";
   if (err?.code === "LIMIT_FILE_COUNT") {
     return single ? "Une seule vidéo à la fois." : "Cinq vidéos maximum.";
   }
@@ -110,6 +152,17 @@ function sendJson(res, status, body) {
   res.end(payload);
 }
 
+function sendJsonIfOpen(res, status, body) {
+  if (res.destroyed || res.writableEnded) return false;
+  try {
+    sendJson(res, status, body);
+    return true;
+  } catch (err) {
+    if (res.destroyed || res.writableEnded || err.code === "ERR_STREAM_DESTROYED") return false;
+    throw err;
+  }
+}
+
 function headerParam(header, key) {
   if (key === "filename") {
     const star = /filename\*\s*=\s*UTF-8''([^;]+)/i.exec(header);
@@ -123,7 +176,7 @@ function headerParam(header, key) {
   return plain ? plain[1].trim() : "";
 }
 
-function readVideos(req, { maxFiles, maxFileBytes, accept }) {
+function readVideos(req, { maxFiles, maxFileBytes, maxTotalBytes, accept }) {
   const contentType = req.headers["content-type"] || "";
   const found = contentType.match(/boundary=(?:"([^"]+)"|([^;]+))/i);
   if (!found) {
@@ -144,8 +197,10 @@ function readVideos(req, { maxFiles, maxFileBytes, accept }) {
     let size = 0;
     let settled = false;
     let holdToken = 0;
+    let totalBytes = 0;
     const files = [];
     const pending = [];
+    const openStreams = new Map();
 
     // write() then end() never emits drain. Hold until drain, finish, or close,
     // otherwise the rest of the upload stays unread and the page waits forever.
@@ -169,8 +224,15 @@ function readVideos(req, { maxFiles, maxFileBytes, accept }) {
     function fail(err) {
       if (settled) return;
       settled = true;
-      if (stream) stream.destroy();
-      reject(err.code ? err : Object.assign(err, { code: err.code || "FORMAT" }));
+      holdToken += 1;
+      req.resume();
+      const normalized = err.code ? err : Object.assign(err, { code: err.code || "FORMAT" });
+      const closing = [];
+      for (const [writable, closed] of openStreams) {
+        closing.push(closed);
+        if (!writable.destroyed) writable.destroy();
+      }
+      Promise.allSettled(closing).then(() => reject(normalized));
     }
 
     function writeBody(chunk) {
@@ -206,10 +268,7 @@ function readVideos(req, { maxFiles, maxFileBytes, accept }) {
       }
       if (stream) {
         const current = stream;
-        pending.push(new Promise((done, failed) => {
-          current.on("finish", done);
-          current.on("error", failed);
-        }));
+        pending.push(openStreams.get(current));
         current.end();
         stream = null;
       }
@@ -250,6 +309,10 @@ function readVideos(req, { maxFiles, maxFileBytes, accept }) {
       if (!dest) throw Object.assign(new Error("format"), { code: "FORMAT" });
       stream = fs.createWriteStream(dest);
       stream.on("error", fail);
+      const current = stream;
+      const closed = new Promise((done) => current.once("close", done));
+      openStreams.set(current, closed);
+      current.once("close", () => openStreams.delete(current));
       files.push({ ...meta, path: dest });
       discarding = false;
     }
@@ -277,7 +340,9 @@ function readVideos(req, { maxFiles, maxFileBytes, accept }) {
             return;
           }
           if (buffer[0] === 45 && buffer[1] === 45) {
-            buffer = buffer.subarray(2);
+            // Tout ce qui suit la boundary finale est uniquement compté par la
+            // limite globale ; ne jamais en conserver une vue en mémoire.
+            buffer = Buffer.alloc(0);
             state = "done";
             return;
           }
@@ -323,6 +388,14 @@ function readVideos(req, { maxFiles, maxFileBytes, accept }) {
 
     req.on("data", (chunk) => {
       if (settled) return;
+      totalBytes += chunk.length;
+      if (totalBytes > maxTotalBytes) {
+        fail(Object.assign(new Error("total size"), { code: "LIMIT_TOTAL_SIZE" }));
+        return;
+      }
+      // Le client peut continuer à envoyer après la boundary finale. On compte
+      // encore ces octets, mais on ne les accumule jamais en mémoire.
+      if (state === "done") return;
       buffer = buffer.length ? Buffer.concat([buffer, chunk]) : chunk;
       try { pump(false); } catch (err) { fail(err); }
     });
@@ -341,6 +414,12 @@ function readVideos(req, { maxFiles, maxFileBytes, accept }) {
       } catch (err) { fail(err); }
     });
     req.on("error", fail);
+    const abort = () => fail(Object.assign(new Error("request aborted"), { code: "ABORTED" }));
+    req.on("aborted", abort);
+    req.on("close", () => {
+      if (!settled && !req.complete) abort();
+    });
+    if (req.aborted) abort();
   });
 }
 
@@ -385,9 +464,11 @@ function present(job) {
   };
 }
 
-function sweep() {
-  if (!fs.existsSync(DATA)) return;
+function sweep(limits = requestLimits()) {
+  pruneHits(limits.maxHitClients);
   const now = Date.now();
+  expireFinishedJobs(jobs, { now, ttlMs: TTL_MS });
+  if (!fs.existsSync(DATA)) return;
   for (const name of fs.readdirSync(DATA)) {
     if (!ID_RE.test(name)) continue;
     const job = jobs.get(name);
@@ -459,8 +540,13 @@ function stampAssets(html) {
 }
 
 function serveStatic(req, res) {
-  const url = new URL(req.url, "http://localhost");
-  let pathname = decodeURIComponent(url.pathname);
+  let pathname;
+  try {
+    pathname = decodeURIComponent(new URL(req.url, "http://localhost").pathname);
+  } catch {
+    sendJson(res, 400, { error: "Adresse invalide." });
+    return;
+  }
   if (pathname === "/") pathname = "/index.html";
   const file = path.normalize(path.join(PUBLIC, pathname));
   if (file !== PUBLIC && !file.startsWith(PUBLIC + path.sep)) {
@@ -497,7 +583,12 @@ function serveStatic(req, res) {
   });
 }
 
-async function handleCreate(req, res) {
+function uploadLimit(maxFiles, maxFileBytes, overheadBytes) {
+  const total = maxFiles * maxFileBytes + overheadBytes;
+  return Number.isSafeInteger(total) ? total : Number.MAX_SAFE_INTEGER;
+}
+
+async function handleCreate(req, res, limits) {
   const ip = clientIp(req);
   if (tooMany(ip)) {
     sendJson(res, 429, { error: "Trop de montages pour le moment. Réessaie plus tard." });
@@ -510,7 +601,8 @@ async function handleCreate(req, res) {
     return;
   }
   const declared = Number(req.headers["content-length"] || 0);
-  if (declared > MAX_CLIPS * MAX_FILE_BYTES + 1024 * 1024) {
+  const maxTotalBytes = uploadLimit(limits.maxClips, limits.maxFileBytes, limits.uploadOverheadBytes);
+  if (declared > maxTotalBytes) {
     sendJson(res, 413, { error: "Envoi trop lourd." });
     req.resume();
     return;
@@ -523,8 +615,9 @@ async function handleCreate(req, res) {
   let stored;
   try {
     stored = await readVideos(req, {
-      maxFiles: MAX_CLIPS,
-      maxFileBytes: MAX_FILE_BYTES,
+      maxFiles: limits.maxClips,
+      maxFileBytes: limits.maxFileBytes,
+      maxTotalBytes,
       accept(meta, index) {
         if (!isAllowed(meta)) return null;
         return path.join(dir, `in-${index}${extFor(meta)}`);
@@ -532,18 +625,22 @@ async function handleCreate(req, res) {
     });
   } catch (err) {
     fs.rmSync(dir, { recursive: true, force: true });
-    const status = err.code === "LIMIT_FILE_SIZE" ? 413 : 400;
-    sendJson(res, status, { error: uploadMessage(err) });
+    const status = err.code === "LIMIT_FILE_SIZE" || err.code === "LIMIT_TOTAL_SIZE" ? 413 : 400;
+    if (err.code !== "ABORTED") sendJsonIfOpen(res, status, { error: uploadMessage(err) });
     return;
   }
 
-  if (stored.length < 1 || stored.length > MAX_CLIPS) {
+  if (stored.length < 1 || stored.length > limits.maxClips) {
     fs.rmSync(dir, { recursive: true, force: true });
-    sendJson(res, 400, { error: "Ajoute entre 1 et 5 vidéos." });
+    sendJsonIfOpen(res, 400, { error: `Ajoute entre 1 et ${limits.maxClips} vidéos.` });
     return;
   }
 
-  noteIp(ip);
+  if (res.destroyed || res.writableEnded) {
+    fs.rmSync(dir, { recursive: true, force: true });
+    return;
+  }
+  noteIp(ip, limits.maxHitClients);
   try {
     const probes = [];
     for (const file of stored) {
@@ -582,15 +679,21 @@ async function handleCreate(req, res) {
     };
     jobs.set(id, job);
     queue.push(job);
-    pumpQueue();
-    sendJson(res, 202, present(job));
+    if (sendJsonIfOpen(res, 202, present(job))) {
+      pumpQueue();
+    } else {
+      const queuedAt = queue.indexOf(job);
+      if (queuedAt >= 0) queue.splice(queuedAt, 1);
+      jobs.delete(id);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   } catch (err) {
     fs.rmSync(dir, { recursive: true, force: true });
-    sendJson(res, 400, { error: err.publicMessage || "Ces fichiers ne sont pas lisibles." });
+    sendJsonIfOpen(res, 400, { error: err.publicMessage || "Ces fichiers ne sont pas lisibles." });
   }
 }
 
-async function handleCut(req, res) {
+async function handleCut(req, res, limits) {
   const ip = clientIp(req);
   if (tooMany(ip)) {
     sendJson(res, 429, { error: "Trop de rendus pour le moment. Réessaie plus tard." });
@@ -603,7 +706,8 @@ async function handleCut(req, res) {
     return;
   }
   const declared = Number(req.headers["content-length"] || 0);
-  if (declared > MAX_FILE_BYTES + 1024 * 1024) {
+  const maxTotalBytes = uploadLimit(1, limits.maxFileBytes, limits.uploadOverheadBytes);
+  if (declared > maxTotalBytes) {
     sendJson(res, 413, { error: "Envoi trop lourd." });
     req.resume();
     return;
@@ -617,7 +721,8 @@ async function handleCut(req, res) {
   try {
     stored = await readVideos(req, {
       maxFiles: 1,
-      maxFileBytes: MAX_FILE_BYTES,
+      maxFileBytes: limits.maxFileBytes,
+      maxTotalBytes,
       accept(meta) {
         if (!isAllowed(meta)) return null;
         return path.join(dir, `in-0${extFor(meta)}`);
@@ -625,18 +730,22 @@ async function handleCut(req, res) {
     });
   } catch (err) {
     fs.rmSync(dir, { recursive: true, force: true });
-    const status = err.code === "LIMIT_FILE_SIZE" ? 413 : 400;
-    sendJson(res, status, { error: uploadMessage(err, true) });
+    const status = err.code === "LIMIT_FILE_SIZE" || err.code === "LIMIT_TOTAL_SIZE" ? 413 : 400;
+    if (err.code !== "ABORTED") sendJsonIfOpen(res, status, { error: uploadMessage(err, true) });
     return;
   }
 
   if (stored.length !== 1) {
     fs.rmSync(dir, { recursive: true, force: true });
-    sendJson(res, 400, { error: "Ajoute une vidéo." });
+    sendJsonIfOpen(res, 400, { error: "Ajoute une vidéo." });
     return;
   }
 
-  noteIp(ip);
+  if (res.destroyed || res.writableEnded) {
+    fs.rmSync(dir, { recursive: true, force: true });
+    return;
+  }
+  noteIp(ip, limits.maxHitClients);
   try {
     const volume = parseVolume(stored.fields?.volume);
     const rangesField = parseRangesField(stored.fields?.ranges);
@@ -670,17 +779,28 @@ async function handleCut(req, res) {
     };
     jobs.set(id, job);
     queue.push(job);
-    pumpQueue();
-    sendJson(res, 202, present(job));
+    if (sendJsonIfOpen(res, 202, present(job))) {
+      pumpQueue();
+    } else {
+      const queuedAt = queue.indexOf(job);
+      if (queuedAt >= 0) queue.splice(queuedAt, 1);
+      jobs.delete(id);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   } catch (err) {
     fs.rmSync(dir, { recursive: true, force: true });
-    sendJson(res, 400, { error: err.publicMessage || "Cette vidéo n’est pas lisible." });
+    sendJsonIfOpen(res, 400, { error: err.publicMessage || "Cette vidéo n’est pas lisible." });
   }
 }
 
-function handle(req, res) {
-  const url = new URL(req.url, "http://localhost");
-  const pathname = url.pathname;
+function handle(req, res, limits) {
+  let pathname;
+  try {
+    pathname = new URL(req.url, "http://localhost").pathname;
+  } catch {
+    sendJson(res, 400, { error: "Adresse invalide." });
+    return;
+  }
   if (req.method === "GET" && pathname === "/api/health") {
     sendJson(res, 200, { ok: true });
     return;
@@ -690,16 +810,16 @@ function handle(req, res) {
     return;
   }
   if (req.method === "POST" && pathname === "/api/jobs") {
-    handleCreate(req, res).catch((err) => {
+    handleCreate(req, res, limits).catch((err) => {
       console.error(err);
-      if (!res.headersSent) sendJson(res, 500, { error: "Erreur interne." });
+      if (!res.headersSent) sendJsonIfOpen(res, 500, { error: "Erreur interne." });
     });
     return;
   }
   if (req.method === "POST" && pathname === "/api/cuts") {
-    handleCut(req, res).catch((err) => {
+    handleCut(req, res, limits).catch((err) => {
       console.error(err);
-      if (!res.headersSent) sendJson(res, 500, { error: "Erreur interne." });
+      if (!res.headersSent) sendJsonIfOpen(res, 500, { error: "Erreur interne." });
     });
     return;
   }
@@ -742,16 +862,18 @@ function handle(req, res) {
   sendJson(res, 405, { error: "Méthode refusée." });
 }
 
-function createServer() {
-  return http.createServer(handle);
+function createServer(options = {}) {
+  const limits = requestLimits(options);
+  return http.createServer((req, res) => handle(req, res, limits));
 }
 
 function start() {
+  const limits = requestLimits();
   fs.mkdirSync(DATA, { recursive: true });
-  const timer = setInterval(sweep, 10 * 60 * 1000);
+  const timer = setInterval(() => sweep(limits), 10 * 60 * 1000);
   timer.unref();
-  sweep();
-  createServer().listen(PORT, HOST, () => {
+  sweep(limits);
+  createServer(limits).listen(PORT, HOST, () => {
     console.log(`montage on http://${HOST}:${PORT}`);
   });
 }
