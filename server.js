@@ -146,6 +146,7 @@ function readVideos(req, { maxFiles, maxFileBytes, accept }) {
     let holdToken = 0;
     const files = [];
     const pending = [];
+    const openStreams = new Map();
 
     // write() then end() never emits drain. Hold until drain, finish, or close,
     // otherwise the rest of the upload stays unread and the page waits forever.
@@ -169,8 +170,14 @@ function readVideos(req, { maxFiles, maxFileBytes, accept }) {
     function fail(err) {
       if (settled) return;
       settled = true;
-      if (stream) stream.destroy();
-      reject(err.code ? err : Object.assign(err, { code: err.code || "FORMAT" }));
+      req.resume();
+      const normalized = err.code ? err : Object.assign(err, { code: err.code || "FORMAT" });
+      const closing = [];
+      for (const [writable, closed] of openStreams) {
+        closing.push(closed);
+        if (!writable.destroyed) writable.destroy();
+      }
+      Promise.allSettled(closing).then(() => reject(normalized));
     }
 
     function writeBody(chunk) {
@@ -206,10 +213,7 @@ function readVideos(req, { maxFiles, maxFileBytes, accept }) {
       }
       if (stream) {
         const current = stream;
-        pending.push(new Promise((done, failed) => {
-          current.on("finish", done);
-          current.on("error", failed);
-        }));
+        pending.push(openStreams.get(current));
         current.end();
         stream = null;
       }
@@ -250,6 +254,10 @@ function readVideos(req, { maxFiles, maxFileBytes, accept }) {
       if (!dest) throw Object.assign(new Error("format"), { code: "FORMAT" });
       stream = fs.createWriteStream(dest);
       stream.on("error", fail);
+      const current = stream;
+      const closed = new Promise((done) => current.once("close", done));
+      openStreams.set(current, closed);
+      current.once("close", () => openStreams.delete(current));
       files.push({ ...meta, path: dest });
       discarding = false;
     }
